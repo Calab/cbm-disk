@@ -661,9 +661,11 @@ impl Volume {
     /// disk, keeping its name, type and contents. Each 1581 directory has
     /// its own blocks, so the file is copied there and then deleted
     /// here. Only PRG, SEQ and USR files that aren't GEOS files can be
-    /// moved ([`Error::Unsupported`] otherwise, and on 1541 and 1571
-    /// disks). Fails with [`Error::Locked`] if it's locked, or
-    /// [`Error::AlreadyExists`] if `dir` has that name already.
+    /// moved, not directories ([`Error::Unsupported`] otherwise, and on
+    /// 1541 and 1571 disks). Fails with [`Error::Locked`] if it's locked,
+    /// or [`Error::AlreadyExists`] if `dir` has that name already. Moving
+    /// a file to the directory it's in does nothing, but a locked file or
+    /// one of a kind that can't be moved is still refused.
     ///
     /// ```
     /// use cbm_disk::{FileType, Layout, Volume};
@@ -679,21 +681,22 @@ impl Volume {
     pub fn move_to(&mut self, path: impl AsRef<[u8]>, dir: impl AsRef<[u8]>) -> Result<()> {
         self.need_dirs()?;
         let (from, raw) = self.find(path.as_ref())?;
-        let to = self.resolve_dir(dir.as_ref())?;
-        if from == to {
-            return Ok(());
-        }
+        // A file that can't be moved is refused even when it's already
+        // in `dir`: locked, or of a kind this can't move.
         check_unlocked(&raw)?;
         let file_type = raw.file_type();
         if !file_type.writable() || raw.is_geos(self.layout()) {
-            return Err(Error::Unsupported(format!(
-                "moving {} files",
-                if raw.is_geos(self.layout()) {
-                    "GEOS"
-                } else {
-                    file_type.letters()
-                }
-            )));
+            return Err(Error::Unsupported(if file_type == FileType::Cbm {
+                "moving directories or 1581 partitions".into()
+            } else if raw.is_geos(self.layout()) {
+                "moving GEOS files".into()
+            } else {
+                format!("moving {} files", file_type.letters())
+            }));
+        }
+        let to = self.resolve_dir(dir.as_ref())?;
+        if from == to {
+            return Ok(());
         }
         let name = raw.name();
         if let Some(other) = self.in_dir(&to, &name)? {
@@ -1460,8 +1463,22 @@ mod tests {
             vol.validate().unwrap()
         );
 
+        // A locked file can't be moved, not even to where it already is.
+        vol.lock("TOP").unwrap();
+        for target in ["", "GAMES/OLD"] {
+            assert!(matches!(vol.move_to("TOP", target), Err(Error::Locked(_))));
+        }
+        vol.unlock("TOP").unwrap();
+        vol.move_to("TOP", "").unwrap(); // already there: nothing to do
         vol.move_to("TOP", "GAMES/OLD").unwrap();
         assert_eq!(names(&vol, "GAMES/OLD"), ["PAC", "TOP"]);
+        // Kinds it can't move are refused even where they already are.
+        for (path, target) in [("GAMES/OLD", "GAMES"), ("GAMES/OLD", "")] {
+            assert!(matches!(
+                vol.move_to(path, target),
+                Err(Error::Unsupported(_))
+            ));
+        }
         assert!(matches!(
             vol.delete("GAMES/OLD"),
             Err(Error::DirectoryNotEmpty(_))
@@ -1474,6 +1491,25 @@ mod tests {
         vol.delete("GAMES").unwrap();
         assert_eq!(vol.blocks_free(), 3160 - 1);
         assert!(vol.validate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rel_files_cant_be_moved_even_where_they_are() {
+        let mut vol = blank(Layout::D81);
+        vol.make_dir("SUB", 3).unwrap();
+        vol.write("DATA", FileType::Seq, b"X").unwrap();
+        // Make it a REL file in place: its entry is the first at 40/3.
+        let mut dir = vol.read_sector(40, 3).unwrap().to_vec();
+        let slot = dir[2..]
+            .chunks(32)
+            .position(|e| e[3..7] == *b"DATA")
+            .unwrap();
+        dir[2 + 32 * slot] = 0x80 | FileType::Rel.code();
+        vol.write_sector(40, 3, &dir).unwrap();
+        for target in ["", "SUB"] {
+            let err = vol.move_to("DATA", target).unwrap_err();
+            assert_eq!(err, Error::Unsupported("moving REL files".into()));
+        }
     }
 
     #[test]
