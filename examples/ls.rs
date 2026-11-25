@@ -8,7 +8,7 @@
 //! with every 1581 subdirectory listed in turn, then any problems
 //! `validate` finds.
 
-use cbm_disk::{DiskImage, Volume, petscii::petscii_to_ascii};
+use cbm_disk::{DiskImage, FileSystem, Volume, petscii::petscii_to_ascii};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(path) = std::env::args().nth(1) else {
@@ -28,17 +28,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         if vol.is_geos() { ", GEOS disk" } else { "" },
     );
+    if vol.file_system() != FileSystem::CbmDos {
+        let name = vol
+            .disk_name()
+            .map(|n| format!(", disk name \"{}\"", petscii_to_ascii(&n)))
+            .unwrap_or_default();
+        println!("A {} disk{name}: sectors only.", vol.file_system().name());
+        return Ok(());
+    }
+    let header = |b: Option<Vec<u8>>| petscii_to_ascii(&b.unwrap_or_default());
     println!();
     println!(
         "0 \"{:<16}\" {} {}",
-        petscii_to_ascii(&vol.disk_name()),
-        petscii_to_ascii(&vol.disk_id()),
-        petscii_to_ascii(&vol.dos_type())
+        header(vol.disk_name()),
+        header(vol.disk_id().map(Vec::from)),
+        header(vol.dos_type().map(Vec::from))
     );
     list(&vol, b"", 0)?;
     println!("{} blocks free.", vol.blocks_free());
 
-    let problems = vol.validate();
+    let problems = vol.validate()?;
     println!();
     if problems.is_empty() {
         println!("No problems found.");

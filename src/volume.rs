@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
-use crate::cbmdos::{self, Allocator, Bam, Dir, ExtraTracks, FileType, Raw};
+use crate::cbmdos::{self, Allocator, Bam, Dir, ExtraTracks, FileSystem, FileType, Raw};
 use crate::check::{self, Problem, SectorUse};
 use crate::error::{Error, Result};
 use crate::image::{DiskImage, Layout, SECTOR_SIZE};
@@ -16,6 +16,9 @@ use crate::petscii::{SHIFTED_SPACE, petscii_to_ascii, petscii_to_ascii_lower};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Features {
+    /// Files at all (list, read, write, rename, delete): false unless
+    /// the disk holds [`FileSystem::CbmDos`].
+    pub files: bool,
     /// Directories (1581 partitions): `/` paths, [`Volume::make_dir`],
     /// [`Volume::move_to`]. D81 only.
     pub directories: bool,
@@ -26,6 +29,31 @@ pub struct Features {
     pub max_entries: u32,
     /// The file types [`Volume::write`] can make.
     pub file_types: &'static [FileType],
+}
+
+impl FileSystem {
+    /// What a disk of `layout` holding this file system can do. Without
+    /// a disk, e.g. for a "New disk" dialog:
+    /// `FileSystem::CbmDos.features(Layout::D81).directories`.
+    pub fn features(self, layout: Layout) -> Features {
+        if self != FileSystem::CbmDos {
+            return Features {
+                files: false,
+                directories: false,
+                locking: false,
+                max_entries: 0,
+                file_types: &[],
+            };
+        }
+        let d81 = layout == Layout::D81;
+        Features {
+            files: true,
+            directories: d81,
+            locking: true,
+            max_entries: if d81 { 296 } else { 144 },
+            file_types: &[FileType::Prg, FileType::Seq, FileType::Usr],
+        }
+    }
 }
 
 /// GEOS details of a file, from its directory entry.
@@ -147,27 +175,62 @@ impl DirEntry {
 #[derive(Debug, Clone)]
 pub struct Volume {
     image: DiskImage,
+    fs: FileSystem,
     overwrite: bool,
 }
 
 impl Volume {
-    /// Open the file system on `image`. This doesn't fail on an odd or
-    /// unformatted disk: sector calls always work, and file calls report
-    /// what they can't follow with [`Error::Damaged`].
+    /// Which file system, if any, `image` holds: [`FileSystem::CbmDos`],
+    /// [`FileSystem::CpM`], or `None` when it's neither (e.g. an
+    /// unformatted disk). [`Volume::open`] takes the image, so ask this
+    /// first if you want to keep the image when it isn't one this crate
+    /// can read.
+    ///
+    /// Only the header and the first directory sector are looked at, so
+    /// a CBM disk that's damaged elsewhere still counts as CBM DOS (and
+    /// [`Volume::validate`] reports the damage).
+    pub fn detect(image: &DiskImage) -> Option<FileSystem> {
+        cbmdos::detect(image)
+    }
+
+    /// Open the file system on `image`. When [`Volume::detect`] finds
+    /// none, the volume is [`FileSystem::Raw`]. On a raw or CP/M disk the
+    /// sector calls work and the file calls give [`Error::Unsupported`]
+    /// ([`Volume::features`] says which).
     ///
     /// ```no_run
-    /// use cbm_disk::{DiskImage, Volume};
+    /// use cbm_disk::{DiskImage, FileSystem, Volume};
     ///
     /// let bytes = std::fs::read("GAMES.D64")?;
     /// let vol = Volume::open(DiskImage::from_bytes(&bytes)?)?;
-    /// println!("{} blocks free", vol.blocks_free());
+    /// match vol.file_system() {
+    ///     FileSystem::CbmDos => println!("{} blocks free", vol.blocks_free()),
+    ///     other => println!("a {} disk: sectors only", other.name()),
+    /// }
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn open(image: DiskImage) -> Result<Self> {
-        Ok(Self {
+        let fs = Self::detect(&image).unwrap_or(FileSystem::Raw);
+        Ok(Self::with(image, fs))
+    }
+
+    /// Open `image` as [`FileSystem::Raw`] whatever it holds: sectors
+    /// only, e.g. to repair a damaged disk by hand.
+    pub fn open_raw(image: DiskImage) -> Self {
+        Self::with(image, FileSystem::Raw)
+    }
+
+    fn with(image: DiskImage, fs: FileSystem) -> Self {
+        Self {
             image,
+            fs,
             overwrite: false,
-        })
+        }
+    }
+
+    /// The file system on the disk ([`FileSystem::Raw`] if none).
+    pub fn file_system(&self) -> FileSystem {
+        self.fs
     }
 
     /// A blank, formatted disk, as the drive's `N0:name,id` command makes
@@ -180,7 +243,7 @@ impl Volume {
     ///
     /// let vol = Volume::format(Layout::D81, b"BACKUP", *b"42")?;
     /// assert_eq!(vol.blocks_free(), 3160);
-    /// assert_eq!(vol.disk_name(), b"BACKUP");
+    /// assert_eq!(vol.disk_name(), Some(b"BACKUP".to_vec()));
     /// # Ok::<(), cbm_disk::Error>(())
     /// ```
     pub fn format(layout: Layout, name: impl AsRef<[u8]>, id: [u8; 2]) -> Result<Self> {
@@ -197,21 +260,19 @@ impl Volume {
     /// What this disk can do (see [`Features`]).
     ///
     /// ```
-    /// use cbm_disk::{Layout, Volume};
+    /// use cbm_disk::{DiskImage, FileSystem, Layout, Volume};
     ///
     /// let vol = Volume::format(Layout::D64, b"", *b"00")?;
-    /// assert!(!vol.features().directories);
+    /// assert!(vol.features().files && !vol.features().directories);
     /// assert_eq!(vol.features().max_entries, 144);
+    /// // An unformatted disk: sectors only.
+    /// let raw = Volume::open(DiskImage::new(Layout::D64))?;
+    /// assert_eq!(raw.file_system(), FileSystem::Raw);
+    /// assert!(!raw.features().files);
     /// # Ok::<(), cbm_disk::Error>(())
     /// ```
     pub fn features(&self) -> Features {
-        let d81 = self.layout() == Layout::D81;
-        Features {
-            directories: d81,
-            locking: true,
-            max_entries: if d81 { 296 } else { 144 },
-            file_types: &[FileType::Prg, FileType::Seq, FileType::Usr],
-        }
+        self.fs.features(self.layout())
     }
 
     /// The disk image, to save.
@@ -232,9 +293,14 @@ impl Volume {
     /// Write a sector directly, bypassing the file system: for making
     /// custom disks. `bytes` must be 256 long. Nothing checks that the
     /// file system still makes sense afterwards; if it doesn't, file calls
-    /// fail with [`Error::Damaged`].
+    /// fail with [`Error::Damaged`]. If the disk now holds a different
+    /// file system, the volume switches to it.
     pub fn write_sector(&mut self, track: u8, sector: u8, bytes: &[u8]) -> Result<()> {
-        self.image.write_sector(track, sector, bytes)
+        self.image.write_sector(track, sector, bytes)?;
+        if let Some(fs) = Self::detect(&self.image) {
+            self.fs = fs;
+        }
+        Ok(())
     }
 
     /// Let [`Volume::write`] replace a file that's already there, instead
@@ -276,44 +342,51 @@ impl Volume {
         }
     }
 
-    fn header_bytes(&self, at: usize, len: usize) -> Vec<u8> {
+    /// Bytes of the header sector, if the disk has a CBM header (CBM DOS
+    /// and the C128's CP/M disks do; raw ones don't).
+    fn header_bytes(&self, at: usize, len: usize) -> Option<Vec<u8>> {
+        if self.fs == FileSystem::Raw {
+            return None;
+        }
         let (t, ..) = self.header();
         let s = self.image.sector(t, 0).expect("on disk");
-        s[at..at + len].to_vec()
+        Some(s[at..at + len].to_vec())
     }
 
     /// The disk name as stored (PETSCII, without its `$A0` padding).
-    pub fn disk_name(&self) -> Vec<u8> {
+    /// `None` on a [`FileSystem::Raw`] disk; CP/M disks have one too.
+    pub fn disk_name(&self) -> Option<Vec<u8>> {
         let (_, at, ..) = self.header();
-        cbmdos::trim_name(&self.header_bytes(at, 16))
+        Some(cbmdos::trim_name(&self.header_bytes(at, 16)?))
     }
 
-    /// The two-byte disk ID.
-    pub fn disk_id(&self) -> [u8; 2] {
+    /// The two-byte disk ID (`None` on a raw disk).
+    pub fn disk_id(&self) -> Option<[u8; 2]> {
         let (_, _, at, _) = self.header();
-        let b = self.header_bytes(at, 2);
-        [b[0], b[1]]
+        let b = self.header_bytes(at, 2)?;
+        Some([b[0], b[1]])
     }
 
     /// The two-byte DOS type shown after the ID: `2A` on 1541 and 1571
-    /// disks, `3D` on 1581 disks.
-    pub fn dos_type(&self) -> [u8; 2] {
+    /// disks, `3D` on 1581 disks (`None` on a raw disk).
+    pub fn dos_type(&self) -> Option<[u8; 2]> {
         let (.., at) = self.header();
-        let b = self.header_bytes(at, 2);
-        [b[0], b[1]]
+        let b = self.header_bytes(at, 2)?;
+        Some([b[0], b[1]])
     }
 
     /// The DOS version byte: `$41` (`A`) on 1541 and 1571 disks, `$44`
-    /// (`D`) on 1581 disks. A 1541 refuses to write to a disk with any
-    /// other value ("soft" write protection); this crate only reports it,
-    /// and the program decides.
-    pub fn dos_version(&self) -> u8 {
-        let (t, ..) = self.header();
-        self.image.sector(t, 0).expect("on disk")[2]
+    /// (`D`) on 1581 disks (`None` on a raw disk). A 1541 refuses to write
+    /// to a disk with any other value ("soft" write protection); this
+    /// crate only reports it, and the program decides.
+    pub fn dos_version(&self) -> Option<u8> {
+        Some(self.header_bytes(2, 1)?[0])
     }
 
-    /// Set the disk name: up to 16 PETSCII bytes.
+    /// Set the disk name: up to 16 PETSCII bytes (CBM DOS only;
+    /// [`Error::Unsupported`] otherwise).
     pub fn set_disk_name(&mut self, name: impl AsRef<[u8]>) -> Result<()> {
+        self.need_files()?;
         let name = name.as_ref();
         check_disk_name(name)?;
         let (t, at, ..) = self.header();
@@ -322,8 +395,9 @@ impl Volume {
     }
 
     /// Set the two-byte disk ID (on a 1581 disk, the copies in its BAM
-    /// too).
+    /// too). CBM DOS only.
     pub fn set_disk_id(&mut self, id: [u8; 2]) -> Result<()> {
+        self.need_files()?;
         let (t, _, at, _) = self.header();
         self.image.sector_mut(t, 0)?[at..at + 2].copy_from_slice(&id);
         if self.layout() == Layout::D81 {
@@ -337,22 +411,24 @@ impl Volume {
     /// How a 40-track D64 keeps tracks 36–40 in its BAM; `None` on other
     /// disks.
     pub fn extra_tracks(&self) -> Option<ExtraTracks> {
-        (self.layout() == Layout::D64_40)
+        (self.layout() == Layout::D64_40 && self.fs == FileSystem::CbmDos)
             .then(|| Bam::new(&self.image, &Dir::root(self.layout())).extra())
     }
 
     /// Is this a GEOS disk (the signature `GEOS format` at `$AD` of the
     /// header sector)?
     pub fn is_geos(&self) -> bool {
-        let (t, ..) = self.header();
-        self.image.sector(t, 0).expect("on disk")[0xAD..0xB8] == *b"GEOS format"
+        self.fs == FileSystem::CbmDos && check::geos_border(&self.image).is_some()
     }
 
     // -- Free space ------------------------------------------------------
 
     /// Blocks free, as the drive's directory listing shows it (the
-    /// directory track isn't counted).
+    /// directory track isn't counted). 0 unless the disk is CBM DOS.
     pub fn blocks_free(&self) -> u32 {
+        if self.fs != FileSystem::CbmDos {
+            return 0;
+        }
         let root = Dir::root(self.layout());
         Bam::new(&self.image, &root).blocks_free(&self.image, &root)
     }
@@ -776,46 +852,63 @@ impl Volume {
     /// What each sector holds, in image order: index `n` is the sector at
     /// [`Layout::position`]`(n)` (track 1 sector 0 first). Where two
     /// things claim a sector it shows the first; [`Volume::validate`]
-    /// reports both.
+    /// reports both. CBM DOS only ([`Error::Unsupported`] otherwise).
     ///
     /// ```
     /// use cbm_disk::{FileType, Layout, SectorUse, Volume};
     ///
     /// let mut vol = Volume::format(Layout::D64, b"", *b"00")?;
     /// vol.write("HI", FileType::Seq, b"HELLO")?;
-    /// let map = vol.sector_map();
+    /// let map = vol.sector_map()?;
     /// let at = |t, s| Layout::D64.index(t, s).unwrap();
     /// assert_eq!(map[at(18, 0)], SectorUse::System); // the BAM
     /// assert_eq!(map[at(18, 1)], SectorUse::Directory(vec![]));
     /// assert_eq!(map[at(17, 0)], SectorUse::File(b"HI".to_vec()));
     /// # Ok::<(), cbm_disk::Error>(())
     /// ```
-    pub fn sector_map(&self) -> Vec<SectorUse> {
-        check::scan(&self.image).map
+    pub fn sector_map(&self) -> Result<Vec<SectorUse>> {
+        self.need_files()?;
+        Ok(check::scan(&self.image).map)
     }
 
     /// Check the whole disk, changing nothing: every file and directory
     /// can be followed, no block is claimed twice, the BAM marks exactly
     /// the blocks in use, its counts match its bitmaps, and every file
-    /// was closed. An empty list means the disk is sound.
+    /// was closed. An empty list means the disk is sound. Fails with
+    /// [`Error::Unsupported`] unless the disk is CBM DOS.
     ///
     /// ```
     /// use cbm_disk::{Layout, Volume};
     ///
     /// let vol = Volume::format(Layout::D71, b"", *b"00")?;
-    /// for problem in vol.validate() {
+    /// for problem in vol.validate()? {
     ///     println!("{problem}"); // e.g. "block 17/3 is marked free but belongs to file GAME"
     /// }
-    /// assert!(vol.validate().is_empty());
+    /// assert!(vol.validate()?.is_empty());
     /// # Ok::<(), cbm_disk::Error>(())
     /// ```
-    pub fn validate(&self) -> Vec<Problem> {
-        check::scan(&self.image).problems
+    pub fn validate(&self) -> Result<Vec<Problem>> {
+        self.need_files()?;
+        Ok(check::scan(&self.image).problems)
     }
 
     // -- Inside ----------------------------------------------------------
 
+    /// File calls need a CBM DOS disk.
+    fn need_files(&self) -> Result<()> {
+        match self.fs {
+            FileSystem::CbmDos => Ok(()),
+            FileSystem::CpM => Err(Error::Unsupported(
+                "this is a CP/M disk: only sector access is supported".into(),
+            )),
+            FileSystem::Raw => Err(Error::Unsupported(
+                "no CBM DOS file system was found on this disk: only sector access works".into(),
+            )),
+        }
+    }
+
     fn need_dirs(&self) -> Result<()> {
+        self.need_files()?;
         if self.features().directories {
             Ok(())
         } else {
@@ -900,6 +993,7 @@ impl Volume {
 
     /// The directory a path ends in.
     fn resolve_dir(&self, path: &[u8]) -> Result<Dir> {
+        self.need_files()?;
         let path = path.strip_suffix(b"/").unwrap_or(path);
         let root = Dir::root(self.layout());
         if path.is_empty() {
@@ -917,6 +1011,7 @@ impl Volume {
     /// the path only where the part before it is a subdirectory, and an
     /// entry whose whole name matches what's left wins.
     fn locate(&self, path: &[u8]) -> Result<(Dir, Vec<u8>)> {
+        self.need_files()?;
         let mut dir = Dir::root(self.layout());
         let mut rest = path;
         let mut depth = 0;
@@ -1144,14 +1239,14 @@ mod tests {
         for (layout, free) in [(Layout::D64, 664), (Layout::D71, 1328), (Layout::D81, 3160)] {
             let vol = blank(layout);
             assert_eq!(vol.blocks_free(), free, "{layout:?}");
-            assert_eq!(vol.disk_name(), b"TEST");
-            assert_eq!(vol.disk_id(), *b"01");
+            assert_eq!(vol.disk_name(), Some(b"TEST".to_vec()));
+            assert_eq!(vol.disk_id(), Some(*b"01"));
             assert!(vol.list("").unwrap().is_empty());
-            assert!(vol.validate().is_empty(), "{layout:?}");
+            assert!(vol.validate().unwrap().is_empty(), "{layout:?}");
         }
-        assert_eq!(blank(Layout::D64).dos_type(), *b"2A");
-        assert_eq!(blank(Layout::D81).dos_type(), *b"3D");
-        assert_eq!(blank(Layout::D81).dos_version(), b'D');
+        assert_eq!(blank(Layout::D64).dos_type(), Some(*b"2A"));
+        assert_eq!(blank(Layout::D81).dos_type(), Some(*b"3D"));
+        assert_eq!(blank(Layout::D81).dos_version(), Some(b'D'));
         assert!(matches!(
             Volume::format(Layout::D64_40, b"", *b"00"),
             Err(Error::Unsupported(_))
@@ -1187,7 +1282,7 @@ mod tests {
             assert_eq!(vol.read("DATA").unwrap(), b"NEW");
             assert_eq!(vol.entry("DATA").unwrap().file_type, FileType::Prg);
             assert_eq!(names(&vol, ""), ["DATA", "FULL", "EMPTY"]);
-            assert!(vol.validate().is_empty());
+            assert!(vol.validate().unwrap().is_empty());
             assert!(matches!(
                 vol.write("REL", FileType::Rel, b""),
                 Err(Error::Unsupported(_))
@@ -1205,7 +1300,7 @@ mod tests {
         vol.set_overwrite(true);
         vol.write("BIG", FileType::Prg, &vec![2; all]).unwrap();
         assert_eq!(vol.blocks_free(), 0);
-        assert!(vol.validate().is_empty());
+        assert!(vol.validate().unwrap().is_empty());
     }
 
     #[test]
@@ -1219,7 +1314,7 @@ mod tests {
         vol.write("THREE", FileType::Seq, b"3").unwrap();
         assert_eq!(names(&vol, ""), ["THREE", "TWO"]);
         assert!(matches!(vol.delete("ONE"), Err(Error::NotFound(_))));
-        assert!(vol.validate().is_empty());
+        assert!(vol.validate().unwrap().is_empty());
     }
 
     #[test]
@@ -1301,7 +1396,7 @@ mod tests {
                 Err(Error::DirectoryFull)
             );
             assert_eq!(vol.features().max_entries, max);
-            assert!(vol.validate().is_empty());
+            assert!(vol.validate().unwrap().is_empty());
         }
     }
 
@@ -1311,8 +1406,8 @@ mod tests {
         vol.write("BIG", FileType::Prg, &vec![9; 254 * 1000])
             .unwrap();
         assert_eq!(vol.blocks_free(), 328);
-        assert!(vol.validate().is_empty());
-        let map = vol.sector_map();
+        assert!(vol.validate().unwrap().is_empty());
+        let map = vol.sector_map().unwrap();
         let at = |t, s| Layout::D71.index(t, s).unwrap();
         assert_eq!(map[at(53, 0)], SectorUse::System);
         assert_eq!(map[at(53, 1)], SectorUse::Reserved);
@@ -1359,7 +1454,11 @@ mod tests {
         // A name with `/` where no directory matches is just a name.
         vol.write("TOP/X", FileType::Seq, b"SLASH").unwrap();
         assert_eq!(vol.read("TOP/X").unwrap(), b"SLASH");
-        assert!(vol.validate().is_empty(), "{:?}", vol.validate());
+        assert!(
+            vol.validate().unwrap().is_empty(),
+            "{:?}",
+            vol.validate().unwrap()
+        );
 
         vol.move_to("TOP", "GAMES/OLD").unwrap();
         assert_eq!(names(&vol, "GAMES/OLD"), ["PAC", "TOP"]);
@@ -1374,7 +1473,7 @@ mod tests {
         vol.delete("GAMES/NEW").unwrap();
         vol.delete("GAMES").unwrap();
         assert_eq!(vol.blocks_free(), 3160 - 1);
-        assert!(vol.validate().is_empty());
+        assert!(vol.validate().unwrap().is_empty());
     }
 
     #[test]
@@ -1391,7 +1490,7 @@ mod tests {
         ));
         vol.make_dir_at("A", 10, 3).unwrap();
         assert_eq!(vol.entry("A").unwrap().start, (10, 0));
-        assert!(vol.validate().is_empty());
+        assert!(vol.validate().unwrap().is_empty());
     }
 
     #[test]
@@ -1406,7 +1505,7 @@ mod tests {
         bam.set(&mut image, 1, 0, false).unwrap();
         image.sector_mut(18, 0).unwrap()[4 * 2] = 5;
         let vol = Volume::open(image).unwrap();
-        let problems = vol.validate();
+        let problems = vol.validate().unwrap();
         assert!(problems.contains(&Problem::MarkedFree {
             track: start.0,
             sector: start.1,
@@ -1444,7 +1543,7 @@ mod tests {
         let e = vol.entry("SPLAT").unwrap();
         assert!(!e.closed && e.damaged);
         assert_eq!(e.type_text(), "*SEQ");
-        let problems = vol.validate();
+        let problems = vol.validate().unwrap();
         assert!(problems.contains(&Problem::Unclosed {
             path: b"SPLAT".to_vec()
         }));
@@ -1478,8 +1577,8 @@ mod tests {
         let mut vol = blank(Layout::D81);
         vol.set_disk_name("NEW NAME").unwrap();
         vol.set_disk_id(*b"ZZ").unwrap();
-        assert_eq!(vol.disk_name(), b"NEW NAME");
-        assert_eq!(vol.disk_id(), *b"ZZ");
+        assert_eq!(vol.disk_name(), Some(b"NEW NAME".to_vec()));
+        assert_eq!(vol.disk_id(), Some(*b"ZZ"));
         assert_eq!(&vol.read_sector(40, 1).unwrap()[4..6], b"ZZ");
         assert!(vol.features().directories && vol.features().locking);
         assert!(!vol.is_geos());
@@ -1516,6 +1615,90 @@ mod tests {
         assert_eq!(vol.blocks_free(), 664 + 85);
         vol.write("ALL", FileType::Prg, &vec![0; 749 * 254])
             .unwrap();
-        assert!(vol.validate().is_empty());
+        assert!(vol.validate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn detects_cbm_dos_raw_and_cpm() {
+        for layout in [Layout::D64, Layout::D71, Layout::D81] {
+            let vol = blank(layout);
+            assert_eq!(Volume::detect(vol.image()), Some(FileSystem::CbmDos));
+            assert_eq!(vol.file_system(), FileSystem::CbmDos);
+            // Unformatted: raw, sectors only.
+            let raw = Volume::open(DiskImage::new(layout)).unwrap();
+            assert_eq!(Volume::detect(raw.image()), None);
+            assert_eq!(raw.file_system(), FileSystem::Raw);
+            assert!(!raw.features().files);
+            assert_eq!(raw.blocks_free(), 0);
+            assert_eq!(raw.disk_name(), None);
+            for result in [
+                raw.list("").map(|_| ()),
+                raw.read("X").map(|_| ()),
+                raw.validate().map(|_| ()),
+                raw.sector_map().map(|_| ()),
+            ] {
+                assert!(matches!(result, Err(Error::Unsupported(_))));
+            }
+            assert!(!raw.exists("X"));
+            assert!(raw.read_sector(1, 0).is_ok());
+        }
+        // open_raw ignores what's there.
+        let forced = Volume::open_raw(blank(Layout::D64).into_image());
+        assert_eq!(forced.file_system(), FileSystem::Raw);
+        assert!(matches!(
+            forced.clone().write("X", FileType::Prg, b""),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn a_damaged_header_is_still_cbm_dos() {
+        // The header's link is garbage, but 18/1 is a directory sector:
+        // the drive starts there anyway (as on copy-protected disks).
+        let mut vol = blank(Layout::D64);
+        vol.write("GAME", FileType::Prg, b"X").unwrap();
+        let mut image = vol.into_image();
+        image.sector_mut(18, 0).unwrap()[..3].copy_from_slice(&[0x00, 0xA0, 0x28]);
+        let vol = Volume::open(image).unwrap();
+        assert_eq!(vol.file_system(), FileSystem::CbmDos);
+        assert_eq!(vol.read("GAME").unwrap(), b"X");
+    }
+
+    #[test]
+    fn c128_cpm_disks_are_recognised() {
+        // The C128 CP/M signature: `CBM` at 1/0, the header linked to 1/5.
+        let mut image = blank(Layout::D71).into_image();
+        image.sector_mut(1, 0).unwrap()[..3].copy_from_slice(b"CBM");
+        image.sector_mut(18, 0).unwrap()[..2].copy_from_slice(&[1, 5]);
+        let vol = Volume::open(image).unwrap();
+        assert_eq!(vol.file_system(), FileSystem::CpM);
+        assert_eq!(vol.file_system().name(), "CP/M");
+        assert_eq!(vol.disk_name(), Some(b"TEST".to_vec()));
+        let err = vol.list("").unwrap_err();
+        assert!(err.to_string().contains("CP/M"), "{err}");
+        // A C128 boot sector alone doesn't make a CP/M disk.
+        let mut image = blank(Layout::D64).into_image();
+        image.sector_mut(1, 0).unwrap()[..3].copy_from_slice(b"CBM");
+        assert_eq!(Volume::detect(&image), Some(FileSystem::CbmDos));
+    }
+
+    #[test]
+    fn writing_sectors_can_change_the_file_system() {
+        let mut vol = Volume::open(DiskImage::new(Layout::D64)).unwrap();
+        assert_eq!(vol.file_system(), FileSystem::Raw);
+        let blank = blank(Layout::D64);
+        for s in 0..2 {
+            vol.write_sector(18, s, blank.read_sector(18, s).unwrap())
+                .unwrap();
+        }
+        assert_eq!(vol.file_system(), FileSystem::CbmDos);
+        assert_eq!(vol.blocks_free(), 664);
+    }
+
+    #[test]
+    fn features_without_a_disk() {
+        assert!(FileSystem::CbmDos.features(Layout::D81).directories);
+        assert!(!FileSystem::CbmDos.features(Layout::D71).directories);
+        assert!(!FileSystem::CpM.features(Layout::D81).files);
     }
 }

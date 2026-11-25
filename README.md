@@ -59,6 +59,9 @@ converts the rest.
   record index only, for now); they aren't written.
 - `validate()` checks a disk without changing it; `sector_map()` says
   what every block holds.
+- Full sector access (`read_sector`, `write_sector`) on any disk. A disk
+  with no CBM DOS on it opens as raw, and C128 CP/M disks are recognised
+  as CP/M: both give sector access only.
 
 Not yet: writing REL or GEOS files, formatting 40-track disks, D80/D82,
 and G64 (raw GCR) images.

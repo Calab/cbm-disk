@@ -20,6 +20,8 @@ github.com/Calab/cbm-disk. The agreed plan and test findings are in
   facts go in `src/formats.rs`.
 
 ## Design (agreed with Steve)
+- Copy atari-disk's approach wherever possible; if it has a shortcoming,
+  note it in `tmp/PLAN.md` and update atari-disk too (Steve, 2026-11-25).
 - Mirrors atari-disk's API (`Volume`, `DiskImage`, `DirEntry`, `Features`,
   `validate`, `sector_map`, ...). No file I/O; every change all or nothing.
 - **Mimic the real Commodore drives as closely as possible.** The real

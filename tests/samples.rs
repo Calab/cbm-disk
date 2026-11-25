@@ -5,11 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
-use cbm_disk::{DirEntry, DiskImage, Error, FileType, Layout, Problem, Volume};
+use cbm_disk::{DirEntry, DiskImage, Error, FileSystem, FileType, Layout, Problem, Volume};
 
 fn images() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for dir in ["D64", "D71", "D81"] {
+    for dir in ["D64", "D71", "D81", "CPM"] {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("samples")
             .join(dir);
@@ -77,6 +77,9 @@ fn every_sample_round_trips() {
 fn every_file_reads() {
     for path in images() {
         let (_, vol) = open(&path);
+        if vol.file_system() != FileSystem::CbmDos {
+            continue;
+        }
         let mut entries = Vec::new();
         walk(&vol, b"", &mut entries);
         for (p, e) in entries {
@@ -109,7 +112,10 @@ fn every_file_reads() {
 fn writing_to_sound_samples_keeps_them_sound() {
     for path in images() {
         let (_, mut vol) = open(&path);
-        if !vol.validate().is_empty() || vol.blocks_free() < 3 {
+        if vol.file_system() != FileSystem::CbmDos
+            || !vol.validate().unwrap().is_empty()
+            || vol.blocks_free() < 3
+        {
             continue;
         }
         let before = vol.list("").unwrap();
@@ -118,7 +124,7 @@ fn writing_to_sound_samples_keeps_them_sound() {
             Err(Error::DirectoryFull | Error::DiskFull { .. }) => continue,
             Err(e) => panic!("{}: {e}", path.display()),
         }
-        let problems: Vec<Problem> = vol.validate();
+        let problems: Vec<Problem> = vol.validate().unwrap();
         assert!(problems.is_empty(), "{}: {problems:?}", path.display());
         assert_eq!(vol.read("CBM-DISK TEST").unwrap(), [0x41; 600]);
         // The new file takes the first empty slot, as the drive does;
@@ -130,7 +136,7 @@ fn writing_to_sound_samples_keeps_them_sound() {
             .collect();
         assert_eq!(others, before, "{}", path.display());
         vol.delete("CBM-DISK TEST").unwrap();
-        assert!(vol.validate().is_empty(), "{}", path.display());
+        assert!(vol.validate().unwrap().is_empty(), "{}", path.display());
     }
 }
 
@@ -149,5 +155,24 @@ fn sample_layouts() {
         if layout == Layout::D64_40 {
             assert!(vol.extra_tracks().is_some());
         }
+    }
+}
+
+/// Each sample is recognised as what it is: the C128 CP/M disks (and the
+/// 1581 one) as CP/M; the C64 CP/M disks, which are CBM disks holding a
+/// `CPM` program, and every other sample as CBM DOS.
+#[test]
+fn sample_file_systems() {
+    for path in images() {
+        let (_, vol) = open(&path);
+        let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+        let in_cpm = path.parent().unwrap().ends_with("CPM");
+        let c64_cpm = name == "cpm.d64" || name == "cpm-c64.d64";
+        let expected = if in_cpm && !c64_cpm {
+            FileSystem::CpM
+        } else {
+            FileSystem::CbmDos
+        };
+        assert_eq!(vol.file_system(), expected, "{}", path.display());
     }
 }

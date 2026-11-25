@@ -156,6 +156,29 @@
 //! and sector pairs from `$02`; 0/0 ends it, 0/`$FF` is an empty record),
 //! each an ordinary chain.
 //!
+//! # Telling file systems apart
+//!
+//! [`crate::Volume::detect`] looks only at the header and the first
+//! directory sector, so a CBM disk damaged elsewhere still counts as CBM
+//! DOS. The DOS version and DOS type bytes aren't used: copy protection and
+//! directory art change them (`$42`, `92`, ...), and the drives ignore them
+//! when reading.
+//!
+//! * **C128 CP/M** (1541 and 1571 disks): track 1 sector 0 starts with
+//!   `CBM` (the C128 boot sector, which the CP/M BIOS checks for; its last
+//!   byte is `$FF` on a double-sided disk), *and* the header links to 1/5
+//!   instead of 18/1. A `CBM` boot sector alone is any C128 boot disk.
+//! * **1581 CP/M**: the CBM directory holds only a USR file called
+//!   `COPYRIGHT CBM 86`, and no blocks are free; CP/M's own directory is at
+//!   1/0.
+//! * **C64 CP/M** disks are ordinary CBM disks: one PRG called `CPM`, with
+//!   every other block marked used. They count as CBM DOS.
+//! * **CBM DOS**: the header links to the first directory sector (18/1, or
+//!   40/3 on a 1581), or that sector looks like one (its link is `00 FF`
+//!   or another sector on the directory track). The drives always start
+//!   the directory there, whatever the header says.
+//! * Anything else (an unformatted disk, say) is raw: sectors only.
+//!
 //! # How the drives choose blocks
 //!
 //! The crate copies this exactly; it was checked block for block against

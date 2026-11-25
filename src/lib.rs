@@ -35,7 +35,7 @@
 //!     println!("{:<5} \"{}\" {}", entry.blocks, entry.name_text(), entry.type_text());
 //! }
 //! assert_eq!(vol.read("GAMES/HELLO")?, [0x01, 0x08, 0x00, 0x00]);
-//! assert!(vol.validate().is_empty());
+//! assert!(vol.validate()?.is_empty());
 //!
 //! let bytes = vol.image().to_bytes(); // ready to save as a .d81 file
 //! # assert_eq!(bytes.len(), 819_200);
@@ -57,7 +57,7 @@ mod image;
 pub mod petscii;
 mod volume;
 
-pub use cbmdos::{ExtraTracks, FileType};
+pub use cbmdos::{ExtraTracks, FileSystem, FileType};
 pub use check::{Problem, SectorUse};
 pub use error::{Error, Result};
 pub use image::{DiskImage, Layout, SECTOR_SIZE};

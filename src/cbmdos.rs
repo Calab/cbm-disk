@@ -92,6 +92,73 @@ impl FileType {
     }
 }
 
+/// The file systems a [`crate::Volume`] can find on a disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FileSystem {
+    /// CBM DOS, as the 1541, 1571 and 1581 drives write it (GEOS disks
+    /// included): every call works.
+    CbmDos,
+    /// CP/M (the C128's CP/M Plus, on 1541, 1571 or 1581 disks):
+    /// recognised but not supported, so only the sector calls work, and
+    /// the file calls give [`Error::Unsupported`]. (C64 CP/M disks are
+    /// ordinary CBM DOS disks holding a `CPM` program, so they're
+    /// [`FileSystem::CbmDos`].)
+    CpM,
+    /// No file system this crate knows (or none at all, e.g. an
+    /// unformatted disk): only the sector calls work; file calls give
+    /// [`Error::Unsupported`].
+    Raw,
+}
+
+impl FileSystem {
+    /// Its name, to show: `"CBM DOS"`, `"CP/M"` or `"raw"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            FileSystem::CbmDos => "CBM DOS",
+            FileSystem::CpM => "CP/M",
+            FileSystem::Raw => "raw",
+        }
+    }
+}
+
+/// Which file system `image` holds, if any (see [`crate::Volume::detect`]).
+/// Only the header and first directory sector are looked at, so a CBM
+/// disk that's damaged elsewhere is still CBM DOS. The DOS version and
+/// DOS type bytes aren't used: copy protection and directory art change
+/// them, and the drives ignore them when reading.
+pub(crate) fn detect(image: &DiskImage) -> Option<FileSystem> {
+    let layout = image.layout();
+    let root = Dir::root(layout);
+    let header = image.sector(root.track, 0).ok()?;
+    let link = (header[0], header[1]);
+    // The C128's CP/M Plus: its boot sector at 1/0 (which the CP/M BIOS
+    // checks for `CBM`), and the header pointing at 1/5, not 18/1.
+    let boot = image.sector(1, 0).ok()?;
+    if layout != Layout::D81 && boot[..3] == *b"CBM" && link == (1, 5) {
+        return Some(FileSystem::CpM);
+    }
+    let first = image.sector(root.first.0, root.first.1).ok()?;
+    let looks_like_dir = (first[0] == 0 && first[1] == 0xFF)
+        || (first[0] == root.track && layout.index(first[0], first[1]).is_some());
+    if link != root.first && !looks_like_dir {
+        return None;
+    }
+    // A 1581 CP/M disk: the whole disk is marked used, and the CBM
+    // directory holds just this one entry.
+    if layout == Layout::D81 {
+        let (list, _) = entries(image, &root);
+        if let [only] = &list[..]
+            && only.name() == b"COPYRIGHT CBM 86"
+            && only.file_type() == FileType::Usr
+            && Bam::new(image, &root).blocks_free(image, &root) == 0
+        {
+            return Some(FileSystem::CpM);
+        }
+    }
+    Some(FileSystem::CbmDos)
+}
+
 // ---------------------------------------------------------------------
 // Directories
 
