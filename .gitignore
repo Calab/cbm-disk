@@ -1,0 +1,8 @@
+/target
+# Files for Steve to review.
+/tmp
+# Real disk images from the NAS: copyrighted, so never committed. The tests
+# skip any folder that's missing.
+/samples/D64
+/samples/D71
+/samples/D81

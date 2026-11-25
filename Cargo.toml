@@ -1,0 +1,15 @@
+[package]
+name = "cbm-disk"
+version = "0.1.0"
+edition = "2024"
+authors = ["Steve Norton", "Claude AI"]
+description = "Read and write Commodore disk images (D64, D71, D81) and their CBM DOS file systems"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Calab/cbm-disk"
+readme = "README.md"
+keywords = ["commodore", "c64", "d64", "disk-image", "retro"]
+categories = ["filesystem", "emulators", "parser-implementations"]
+# Only what a user of the library needs.
+include = ["src/**", "README.md", "LICENSE-*"]
+
+[dependencies]
