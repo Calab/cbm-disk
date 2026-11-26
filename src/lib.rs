@@ -2,6 +2,14 @@
 //! the files on them, as the 1541, 1571 and 1581 drives' CBM DOS keeps
 //! them.
 //!
+//! <div class="warning">
+//!
+//! Use at your own risk. There is no warranty. You are responsible for
+//! your own files: keep backups. The authors are not responsible for
+//! lost or damaged files, disk images or data.
+//!
+//! </div>
+//!
 //! # Where to start
 //! * [`Volume`] is what most programs need: open a disk, then list,
 //!   read, write, rename, delete and lock files, make directories (1581

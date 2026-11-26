@@ -11,6 +11,10 @@ drives write, and the drives' own validate command).
 
 **Status:** new; not yet on crates.io, and the API may still change.
 
+> **Warning:** use at your own risk. There is no warranty. You are
+> responsible for your own files: keep backups. The authors are not
+> responsible for lost or damaged files, disk images or data.
+
 ## Using it
 
 Add it to your `Cargo.toml`:
